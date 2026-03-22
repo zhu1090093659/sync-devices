@@ -117,4 +117,67 @@ mod tests {
         let result = scan(content);
         assert!(!result.has_sensitive);
     }
+
+    #[test]
+    fn test_detects_ace_token() {
+        let content = "ace_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+        let result = scan(content);
+        assert!(result.has_sensitive);
+        assert_eq!(result.findings[0].label, "ace_token");
+    }
+
+    #[test]
+    fn test_detects_github_oauth_token() {
+        let content = "oauth = \"gho_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij\"";
+        let result = scan(content);
+        assert!(result.has_sensitive);
+        assert_eq!(result.findings[0].label, "github_oauth");
+    }
+
+    #[test]
+    fn test_detects_bearer_token() {
+        let content = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+        let result = scan(content);
+        assert!(result.has_sensitive);
+        assert!(result.findings.iter().any(|f| f.label == "bearer_token"));
+    }
+
+    #[test]
+    fn test_detects_base64_secret() {
+        let content = "secret = \"dGhpc0lzQVZlcnlMb25nQmFzZTY0U2VjcmV0S2V5VGhhdFNob3VsZEJlRGV0ZWN0ZWQ=\"";
+        let result = scan(content);
+        assert!(result.has_sensitive);
+        assert!(result.findings.iter().any(|f| f.label == "base64_secret"));
+    }
+
+    #[test]
+    fn test_scan_empty_content() {
+        let result = scan("");
+        assert!(!result.has_sensitive);
+        assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn test_scan_reports_correct_line_numbers() {
+        let content = "line one\nsk-abc123def456ghi789jkl012mno345pqr678\nline three";
+        let result = scan(content);
+        assert!(result.has_sensitive);
+        assert_eq!(result.findings[0].line, 2);
+    }
+
+    #[test]
+    fn test_redact_multiple_patterns() {
+        let content = "api = \"sk-abc123def456ghi789jkl012\"\noauth = \"gho_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij\"";
+        let redacted = redact(content);
+        assert!(redacted.contains("<REDACTED:api_key>"));
+        assert!(redacted.contains("<REDACTED:github_oauth>"));
+        assert!(!redacted.contains("sk-abc123"));
+        assert!(!redacted.contains("gho_"));
+    }
+
+    #[test]
+    fn test_redact_preserves_clean_content() {
+        let content = "model = \"gpt-4\"\ntemperature = 0.7";
+        assert_eq!(redact(content), content);
+    }
 }

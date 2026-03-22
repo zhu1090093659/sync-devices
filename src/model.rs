@@ -344,6 +344,17 @@ mod tests {
         item
     }
 
+    fn make_diff_entry(rel_path: &str, status: DiffStatus) -> ManifestDiffEntry {
+        ManifestDiffEntry {
+            tool: Tool::Codex,
+            category: Category::Settings,
+            rel_path: rel_path.to_string(),
+            local: None,
+            remote: None,
+            status,
+        }
+    }
+
     #[test]
     fn manifest_from_items_sorts_entries_and_preserves_metadata() {
         let items = vec![
@@ -584,6 +595,119 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn config_item_new_computes_deterministic_hash() {
+        let a = ConfigItem::new(
+            Tool::Codex,
+            Category::Settings,
+            "config.toml".to_string(),
+            "hello world".to_string(),
+            1,
+            false,
+        );
+        let b = ConfigItem::new(
+            Tool::ClaudeCode,
+            Category::Commands,
+            "other.md".to_string(),
+            "hello world".to_string(),
+            999,
+            true,
+        );
+        // same content => same hash regardless of other fields
+        assert_eq!(a.content_hash, b.content_hash);
+        assert!(!a.content_hash.is_empty());
+    }
+
+    #[test]
+    fn config_item_different_content_different_hash() {
+        let a = ConfigItem::new(
+            Tool::Codex,
+            Category::Settings,
+            "a.toml".to_string(),
+            "aaa".to_string(),
+            1,
+            false,
+        );
+        let b = ConfigItem::new(
+            Tool::Codex,
+            Category::Settings,
+            "a.toml".to_string(),
+            "bbb".to_string(),
+            1,
+            false,
+        );
+        assert_ne!(a.content_hash, b.content_hash);
+    }
+
+    #[test]
+    fn diff_manifests_both_empty_returns_empty() {
+        let local = SyncManifest {
+            device_id: "local".to_string(),
+            generated_at: 0,
+            items: vec![],
+        };
+        let remote = SyncManifest {
+            device_id: "remote".to_string(),
+            generated_at: 0,
+            items: vec![],
+        };
+        assert!(diff_manifests(&local, &remote).is_empty());
+    }
+
+    #[test]
+    fn diff_manifests_local_only_when_remote_empty() {
+        let local = SyncManifest::from_items(
+            "local".to_string(),
+            100,
+            &[item_with_device(
+                Tool::Codex,
+                Category::Settings,
+                "config.toml",
+                "data",
+                1,
+                false,
+                "local",
+            )],
+        );
+        let remote = SyncManifest {
+            device_id: "remote".to_string(),
+            generated_at: 0,
+            items: vec![],
+        };
+        let diff = diff_manifests(&local, &remote);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].status, DiffStatus::LocalOnly);
+    }
+
+    #[test]
+    fn summarize_manifest_diff_counts_correctly() {
+        let entries = vec![
+            make_diff_entry("a", DiffStatus::LocalOnly),
+            make_diff_entry("b", DiffStatus::LocalOnly),
+            make_diff_entry("c", DiffStatus::RemoteOnly),
+            make_diff_entry("d", DiffStatus::Conflict),
+        ];
+        let summary = summarize_manifest_diff(&entries);
+        assert_eq!(summary.local_only, 2);
+        assert_eq!(summary.remote_only, 1);
+        assert_eq!(summary.conflict, 1);
+        assert_eq!(summary.modified, 0);
+        assert_eq!(summary.unchanged, 0);
+    }
+
+    #[test]
+    fn build_push_plan_excludes_conflict_and_remote_only() {
+        let entries = vec![
+            make_diff_entry("local.toml", DiffStatus::LocalOnly),
+            make_diff_entry("conflict.toml", DiffStatus::Conflict),
+            make_diff_entry("remote.toml", DiffStatus::RemoteOnly),
+            make_diff_entry("same.toml", DiffStatus::Unchanged),
+        ];
+        let plan = build_push_plan(&entries);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].rel_path, "local.toml");
     }
 
     #[test]

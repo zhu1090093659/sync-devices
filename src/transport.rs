@@ -230,6 +230,34 @@ impl ApiTransport {
             .join(path)
             .map_err(|error| TransportError::InvalidBaseUrl(error.to_string()))
     }
+
+    #[cfg(test)]
+    pub fn new_for_test(base_url: &str, token: &str) -> Result<Self, TransportError> {
+        let base_url =
+            Url::parse(base_url).map_err(|e| TransportError::InvalidBaseUrl(e.to_string()))?;
+        let http = Client::builder()
+            .build()
+            .map_err(TransportError::ClientBuild)?;
+        let api_base_url = base_url.to_string();
+        Ok(Self {
+            http,
+            base_url,
+            session: StoredSession {
+                access_token: token.to_string(),
+                token_type: "bearer".to_string(),
+                scope: String::new(),
+                expires_in: 3600,
+                api_base_url,
+                user: SessionUser {
+                    id: 0,
+                    login: "test-user".to_string(),
+                    name: None,
+                    avatar_url: String::new(),
+                },
+                stored_at: 0,
+            },
+        })
+    }
 }
 
 fn should_retry(status: StatusCode) -> bool {
@@ -253,9 +281,162 @@ async fn read_error_message(response: Response) -> Result<String, TransportError
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use wiremock::matchers::{bearer_token, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const LIVE_POLL_ATTEMPTS: usize = 20;
     const LIVE_POLL_DELAY_MS: u64 = 500;
+    const TEST_TOKEN: &str = "test-token-abc123";
+
+    #[tokio::test]
+    async fn get_manifest_returns_parsed_manifest() {
+        let server = MockServer::start().await;
+        let manifest = SyncManifest {
+            device_id: "remote-dev".to_string(),
+            generated_at: 100,
+            items: vec![],
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/manifest"))
+            .and(bearer_token(TEST_TOKEN))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&manifest))
+            .mount(&server)
+            .await;
+
+        let client = ApiTransport::new_for_test(&server.uri(), TEST_TOKEN).unwrap();
+        let result = client.get_manifest().await.unwrap();
+        assert_eq!(result.device_id, "remote-dev");
+        assert!(result.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_configs_passes_filters_as_query_params() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/configs"))
+            .and(query_param("tool", "codex"))
+            .and(query_param("category", "settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "codex:settings:config.toml",
+                    "tool": "codex",
+                    "category": "settings",
+                    "rel_path": "config.toml",
+                    "content": "data = true",
+                    "content_hash": "abc123",
+                    "last_modified": 42,
+                    "device_id": "remote-dev",
+                    "is_device_specific": false,
+                    "updated_at": 42
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ApiTransport::new_for_test(&server.uri(), TEST_TOKEN).unwrap();
+        let records = client
+            .list_configs(ConfigListFilters {
+                tool: Some("codex".to_string()),
+                category: Some("settings".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "codex:settings:config.toml");
+        assert_eq!(records[0].content, "data = true");
+    }
+
+    #[tokio::test]
+    async fn upload_config_sends_payload_and_returns_record() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/configs/codex/settings/config.toml"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "item": {
+                    "id": "codex:settings:config.toml",
+                    "tool": "codex",
+                    "category": "settings",
+                    "rel_path": "config.toml",
+                    "content": "new data",
+                    "content_hash": "def456",
+                    "last_modified": 99,
+                    "device_id": "my-device",
+                    "is_device_specific": false,
+                    "updated_at": 99
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ApiTransport::new_for_test(&server.uri(), TEST_TOKEN).unwrap();
+        let record = client
+            .upload_config(
+                "codex",
+                "settings",
+                "config.toml",
+                &ConfigUploadRequest {
+                    content: "new data".to_string(),
+                    content_hash: Some("def456".to_string()),
+                    last_modified: 99,
+                    device_id: Some("my-device".to_string()),
+                    is_device_specific: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.id, "codex:settings:config.toml");
+        assert_eq!(record.device_id, "my-device");
+    }
+
+    #[tokio::test]
+    async fn api_error_returns_transport_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/manifest"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "forbidden",
+                "error_description": "Invalid token"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ApiTransport::new_for_test(&server.uri(), "bad-token").unwrap();
+        let err = client.get_manifest().await.unwrap_err();
+        match err {
+            TransportError::Api { status, message } => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert!(message.contains("Invalid token"));
+            }
+            other => panic!("expected Api error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_config_returns_deleted_record() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/configs/test-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "item": {
+                    "id": "test-id",
+                    "tool": "codex",
+                    "category": "settings",
+                    "rel_path": "config.toml",
+                    "content": "",
+                    "content_hash": "",
+                    "last_modified": 0,
+                    "device_id": "",
+                    "is_device_specific": false,
+                    "updated_at": 0
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ApiTransport::new_for_test(&server.uri(), TEST_TOKEN).unwrap();
+        let deleted = client.delete_config("test-id").await.unwrap();
+        assert_eq!(deleted.id, "test-id");
+    }
 
     #[tokio::test]
     #[ignore = "requires a stored session and live backend access"]

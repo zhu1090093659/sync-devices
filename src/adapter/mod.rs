@@ -260,4 +260,93 @@ mod tests {
 
         assert!(error.to_string().contains("invalid relative path segment"));
     }
+
+    #[test]
+    fn resolve_local_path_from_root_rejects_dot_segment() {
+        let root = PathBuf::from("C:/temp/root");
+        let error = resolve_local_path_from_root(&root, "./bad.txt").unwrap_err();
+
+        assert!(error.to_string().contains("invalid relative path segment"));
+    }
+
+    #[test]
+    fn resolve_local_path_from_root_rejects_empty_path() {
+        let root = PathBuf::from("C:/temp/root");
+        let error = resolve_local_path_from_root(&root, "").unwrap_err();
+
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn resolve_local_path_from_root_builds_nested_path() {
+        let root = PathBuf::from("C:/temp/root");
+        let result = resolve_local_path_from_root(&root, "skills/my-skill/SKILL.md").unwrap();
+
+        assert_eq!(result, PathBuf::from("C:/temp/root/skills/my-skill/SKILL.md"));
+    }
+
+    #[test]
+    fn prepare_sync_item_redacts_and_stamps_device_id() {
+        let raw = ConfigItem::new(
+            Tool::ClaudeCode,
+            Category::Settings,
+            "settings.json".to_string(),
+            "key = \"sk-abc123def456ghi789jkl012\"".to_string(),
+            100,
+            false,
+        );
+        let prepared = prepare_sync_item(&raw, "my-pc");
+
+        assert_eq!(prepared.device_id, "my-pc");
+        assert!(prepared.content.contains("<REDACTED:api_key>"));
+        assert!(!prepared.content.contains("sk-abc123"));
+    }
+
+    #[test]
+    fn config_root_returns_expected_paths_for_each_tool() {
+        // config_root depends on home_dir which may vary, but the suffix is fixed
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(config_root(Tool::ClaudeCode).unwrap(), home.join(".claude"));
+            assert_eq!(config_root(Tool::Codex).unwrap(), home.join(".codex"));
+            assert_eq!(config_root(Tool::Cursor).unwrap(), home.join(".cursor"));
+            assert_eq!(config_root(Tool::SharedAgents).unwrap(), home.join(".agents"));
+        }
+    }
+
+    #[test]
+    fn snapshot_manifest_entries_match_items() {
+        let items = vec![
+            ConfigItem::new(
+                Tool::Codex,
+                Category::Settings,
+                "config.toml".to_string(),
+                "clean content".to_string(),
+                10,
+                false,
+            ),
+            ConfigItem::new(
+                Tool::ClaudeCode,
+                Category::Commands,
+                "commands/test.md".to_string(),
+                "also clean".to_string(),
+                20,
+                true,
+            ),
+        ];
+
+        let snapshot = build_local_snapshot_with_metadata(&items, "dev-1".to_string(), 50);
+
+        assert_eq!(snapshot.items.len(), 2);
+        assert_eq!(snapshot.manifest.items.len(), 2);
+        // every manifest entry should have a corresponding item with matching hash
+        for entry in &snapshot.manifest.items {
+            let item = snapshot
+                .items
+                .iter()
+                .find(|i| i.rel_path == entry.rel_path)
+                .expect("manifest entry must have matching item");
+            assert_eq!(item.content_hash, entry.content_hash);
+            assert_eq!(item.device_id, entry.device_id);
+        }
+    }
 }
