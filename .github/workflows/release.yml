@@ -51,11 +51,11 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
+          # Restrict existing sources to amd64 only
+          sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          # Add arm64 from ports.ubuntu.com
           CODENAME=$(lsb_release -cs)
-          sudo tee /etc/apt/sources.list.d/arm64-ports.list <<EOF
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ ${CODENAME} main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ ${CODENAME}-updates main restricted universe multiverse
-          EOF
+          printf "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ %s main restricted universe multiverse\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ %s-updates main restricted universe multiverse\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ %s-security main restricted universe multiverse\n" "$CODENAME" "$CODENAME" "$CODENAME" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config libdbus-1-dev:arm64
 
