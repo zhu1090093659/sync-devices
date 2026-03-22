@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "sync-devices-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-22",
+  // Replace these placeholder IDs by running:
+  // 1. npm run kv:create
+  // 2. npm run kv:create:preview
+  "kv_namespaces": [
+    {
+      "binding": "SYNC_CONFIGS",
+      "id": "f7b5f3df048a4b62b6bf2d8bdd66464f",
+      "preview_id": "276f5be9896a4dc18430f9d6e3c535be",
+    },
+  ],
+}

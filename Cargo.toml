@@ -1,0 +1,54 @@
+[package]
+name = "sync-devices"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform CLI tool for syncing AI CLI tool configurations across devices"
+license = "MIT"
+repository = "https://github.com/user/sync-devices"
+
+[dependencies]
+# CLI framework
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Text diff
+similar = "2"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Crypto (hashing)
+sha2 = "0.10"
+
+# Directory paths
+dirs = "6"
+
+# Regex (for sanitizer)
+regex = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { version = "3", features = ["linux-native-sync-persistent"] }

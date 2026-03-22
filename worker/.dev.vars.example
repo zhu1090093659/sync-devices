@@ -1,0 +1,12 @@
+# GitHub OAuth App client ID used for Device Flow requests.
+GITHUB_CLIENT_ID="your_github_oauth_app_client_id"
+
+# Secret used to sign JWTs for authenticated API requests.
+JWT_SECRET="replace_with_a_long_random_secret"
+
+# Optional scopes requested during login.
+GITHUB_DEVICE_SCOPE="read:user user:email"
+
+# Optional JWT issuer and lifetime settings.
+JWT_ISSUER="sync-devices-worker"
+JWT_TTL_SECONDS="604800"

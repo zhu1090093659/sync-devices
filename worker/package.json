@@ -1,0 +1,23 @@
+{
+  "name": "sync-devices-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "predeploy": "npm run deploy:check",
+    "deploy:check": "node scripts/verify-deploy-config.mjs",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "predeploy:dry-run": "npm run deploy:check",
+    "kv:create": "wrangler kv namespace create sync-devices-configs --binding SYNC_CONFIGS --update-config",
+    "kv:create:preview": "wrangler kv namespace create sync-devices-configs-preview --binding SYNC_CONFIGS --preview --update-config",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "wrangler": "^4.0.0"
+  }
+}
