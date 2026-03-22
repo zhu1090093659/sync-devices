@@ -6,3 +6,4 @@
 !/worker/.dev.vars.example
 /worker/.env*
 .claude/settings.local.json
+.serena/

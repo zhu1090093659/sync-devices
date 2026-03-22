@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Cross-platform CLI tool for syncing AI CLI tool configurations across devices"
 license = "MIT"
-repository = "https://github.com/user/sync-devices"
+repository = "https://github.com/zhu1090093659/sync-devices"
 readme = "README.md"
 keywords = ["cli", "sync", "config", "ai-tools", "cross-platform"]
 categories = ["command-line-utilities", "config"]
@@ -59,3 +59,22 @@ keyring = { version = "3", features = ["linux-native-sync-persistent"] }
 
 [dev-dependencies]
 wiremock = "0.6"
+
+# cargo-binstall: download pre-built binaries instead of compiling
+[package.metadata.binstall]
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/sync-devices-linux-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/sync-devices-linux-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/sync-devices-darwin-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/sync-devices-darwin-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/sync-devices-windows-x86_64.exe"

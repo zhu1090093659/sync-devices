@@ -16,16 +16,48 @@ Supports **Claude Code**, **Codex**, **Cursor**, and **shared agent skills** —
 
 ## Installation
 
-### From source
+### Quick Install (recommended)
+
+**macOS / Linux:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zhu1090093659/sync-devices/master/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/zhu1090093659/sync-devices/master/install.ps1 | iex
+```
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew install zhu1090093659/tap/sync-devices
+```
+
+### Pre-built Binaries
+
+Download the latest binary for your platform from [GitHub Releases](https://github.com/zhu1090093659/sync-devices/releases/latest):
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `sync-devices-linux-x86_64` |
+| Linux aarch64 | `sync-devices-linux-aarch64` |
+| macOS x86_64 | `sync-devices-darwin-x86_64` |
+| macOS aarch64 | `sync-devices-darwin-aarch64` |
+| Windows x86_64 | `sync-devices-windows-x86_64.exe` |
+
+### cargo-binstall (no compilation)
+
+```bash
+cargo binstall sync-devices
+```
+
+### From Source
 
 ```bash
 cargo install --path .
-```
-
-### From crates.io (planned)
-
-```bash
-cargo install sync-devices
 ```
 
 ## Quick Start
