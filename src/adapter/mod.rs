@@ -4,7 +4,8 @@ mod cursor;
 mod shared_agents;
 
 use crate::model::{Category, ConfigItem, SyncManifest, Tool};
-use anyhow::Result;
+use crate::sanitizer;
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,12 @@ pub trait ConfigAdapter {
 
     /// Scan and collect all syncable config items
     fn scan(&self) -> Result<Vec<ConfigItem>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalSnapshot {
+    pub items: Vec<ConfigItem>,
+    pub manifest: SyncManifest,
 }
 
 /// Scan all supported tools and return a combined list of config items
@@ -90,9 +97,17 @@ pub(crate) fn scan_dir_recursive(
         }
 
         if path.is_dir() {
-            scan_dir_recursive(tool, &path, root, ext, category, is_device_specific, skip_dirs, items)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some(ext.trim_start_matches('.'))
-        {
+            scan_dir_recursive(
+                tool,
+                &path,
+                root,
+                ext,
+                category,
+                is_device_specific,
+                skip_dirs,
+                items,
+            )?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some(ext.trim_start_matches('.')) {
             if let Ok(item) = read_config_item(tool, &path, root, category, is_device_specific) {
                 items.push(item);
             }
@@ -104,18 +119,36 @@ pub(crate) fn scan_dir_recursive(
 
 /// Scan local config files and build a manifest aligned with the remote schema.
 pub fn scan_local_manifest() -> Result<SyncManifest> {
+    Ok(scan_local_snapshot()?.manifest)
+}
+
+/// Scan local config files and build a sanitized sync snapshot.
+pub fn scan_local_snapshot() -> Result<LocalSnapshot> {
     let items = scan_all()?;
-    build_local_manifest(&items)
+    build_local_snapshot(&items)
+}
+
+/// Build a local sync snapshot from scanned config items.
+pub fn build_local_snapshot(items: &[ConfigItem]) -> Result<LocalSnapshot> {
+    let generated_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let device_id = detect_device_id();
+    Ok(build_local_snapshot_with_metadata(
+        items,
+        device_id,
+        generated_at,
+    ))
 }
 
 /// Build a local manifest from scanned config items.
 pub fn build_local_manifest(items: &[ConfigItem]) -> Result<SyncManifest> {
-    let generated_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    Ok(SyncManifest::from_items(
-        detect_device_id(),
-        generated_at,
-        items,
-    ))
+    Ok(build_local_snapshot(items)?.manifest)
+}
+
+/// Resolve the local filesystem path for a sync item.
+pub fn resolve_local_path(tool: Tool, rel_path: &str) -> Result<PathBuf> {
+    let root = config_root(tool)
+        .with_context(|| format!("missing config root directory for tool {}", tool.as_str()))?;
+    resolve_local_path_from_root(&root, rel_path)
 }
 
 fn detect_device_id() -> String {
@@ -130,4 +163,101 @@ fn read_non_empty_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn build_local_snapshot_with_metadata(
+    items: &[ConfigItem],
+    device_id: String,
+    generated_at: u64,
+) -> LocalSnapshot {
+    let prepared_items = items
+        .iter()
+        .map(|item| prepare_sync_item(item, &device_id))
+        .collect::<Vec<_>>();
+    let manifest = SyncManifest::from_items(device_id, generated_at, &prepared_items);
+
+    LocalSnapshot {
+        items: prepared_items,
+        manifest,
+    }
+}
+
+fn prepare_sync_item(item: &ConfigItem, device_id: &str) -> ConfigItem {
+    let redacted_content = sanitizer::redact(&item.content);
+    let mut prepared = ConfigItem::new(
+        item.tool,
+        item.category,
+        item.rel_path.clone(),
+        redacted_content,
+        item.last_modified,
+        item.is_device_specific,
+    );
+    prepared.device_id = device_id.to_string();
+    prepared
+}
+
+fn config_root(tool: Tool) -> Option<PathBuf> {
+    dirs::home_dir().map(|home| match tool {
+        Tool::ClaudeCode => home.join(".claude"),
+        Tool::Codex => home.join(".codex"),
+        Tool::Cursor => home.join(".cursor"),
+        Tool::SharedAgents => home.join(".agents"),
+    })
+}
+
+fn resolve_local_path_from_root(root: &Path, rel_path: &str) -> Result<PathBuf> {
+    let mut resolved = root.to_path_buf();
+    for segment in rel_path.split('/').filter(|segment| !segment.is_empty()) {
+        if segment == "." || segment == ".." {
+            return Err(anyhow!(
+                "invalid relative path segment in sync item: {rel_path}"
+            ));
+        }
+        resolved.push(segment);
+    }
+
+    if resolved == root {
+        return Err(anyhow!("sync item path must not be empty"));
+    }
+
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn build_local_snapshot_redacts_sensitive_content_and_sets_device_id() {
+        let items = vec![ConfigItem::new(
+            Tool::Codex,
+            Category::Settings,
+            "config.toml".to_string(),
+            "token = \"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij\"".to_string(),
+            42,
+            false,
+        )];
+
+        let snapshot = build_local_snapshot_with_metadata(&items, "test-device".to_string(), 99);
+
+        assert_eq!(snapshot.manifest.device_id, "test-device");
+        assert_eq!(snapshot.manifest.generated_at, 99);
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].device_id, "test-device");
+        assert!(snapshot.items[0].content.contains("<REDACTED:github_pat>"));
+        assert_ne!(snapshot.items[0].content_hash, items[0].content_hash);
+        assert_eq!(
+            snapshot.manifest.items[0].content_hash,
+            snapshot.items[0].content_hash
+        );
+    }
+
+    #[test]
+    fn resolve_local_path_from_root_rejects_parent_segments() {
+        let root = PathBuf::from("C:/temp/root");
+        let error = resolve_local_path_from_root(&root, "../bad.txt").unwrap_err();
+
+        assert!(error.to_string().contains("invalid relative path segment"));
+    }
 }

@@ -10,6 +10,8 @@ use tokio::time::sleep;
 
 const MAX_ATTEMPTS: usize = 2;
 const RETRY_DELAY_MS: u64 = 300;
+const CONNECT_TIMEOUT_SECS: u64 = 5;
+const REQUEST_TIMEOUT_SECS: u64 = 15;
 
 pub struct ApiTransport {
     http: Client,
@@ -82,6 +84,8 @@ pub enum TransportError {
     MissingSession,
     #[error(transparent)]
     SessionStore(#[from] SessionStoreError),
+    #[error("HTTP client initialization failed: {0}")]
+    ClientBuild(reqwest::Error),
     #[error("Invalid API base URL: {0}")]
     InvalidBaseUrl(String),
     #[error("HTTP request failed: {0}")]
@@ -96,9 +100,14 @@ impl ApiTransport {
         let session = store.load()?.ok_or(TransportError::MissingSession)?;
         let base_url = Url::parse(&session.api_base_url)
             .map_err(|error| TransportError::InvalidBaseUrl(error.to_string()))?;
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .map_err(TransportError::ClientBuild)?;
 
         Ok(Self {
-            http: Client::new(),
+            http,
             base_url,
             session,
         })

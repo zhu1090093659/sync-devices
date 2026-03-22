@@ -62,6 +62,7 @@ export interface ManifestEntryRecord {
   rel_path: string;
   content_hash: string;
   last_modified: number;
+  device_id: string;
   is_device_specific: boolean;
 }
 
@@ -144,9 +145,7 @@ export async function listConfigRecords(
     });
 
     const batch = await Promise.all(
-      result.keys.map((key) =>
-        store.get<StoredConfigRecord>(key.name, "json"),
-      ),
+      result.keys.map((key) => store.get<StoredConfigRecord>(key.name, "json")),
     );
 
     for (const record of batch) {
@@ -447,6 +446,7 @@ function toManifestEntry(record: StoredConfigRecord): ManifestEntryRecord {
     rel_path: record.rel_path,
     content_hash: record.content_hash,
     last_modified: record.last_modified,
+    device_id: record.device_id,
     is_device_specific: record.is_device_specific,
   };
 }

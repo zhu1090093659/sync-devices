@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Supported AI CLI tools
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tool {
     ClaudeCode,
@@ -14,7 +14,7 @@ pub enum Tool {
 }
 
 /// Configuration item categories
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
     Settings,
@@ -35,6 +35,16 @@ impl Tool {
             Self::SharedAgents => "shared_agents",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claude_code" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
+            "cursor" => Some(Self::Cursor),
+            "shared_agents" => Some(Self::SharedAgents),
+            _ => None,
+        }
+    }
 }
 
 impl Category {
@@ -47,6 +57,19 @@ impl Category {
             Self::Mcp => "mcp",
             Self::Plugins => "plugins",
             Self::Rules => "rules",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "settings" => Some(Self::Settings),
+            "instructions" => Some(Self::Instructions),
+            "commands" => Some(Self::Commands),
+            "skills" => Some(Self::Skills),
+            "mcp" => Some(Self::Mcp),
+            "plugins" => Some(Self::Plugins),
+            "rules" => Some(Self::Rules),
+            _ => None,
         }
     }
 }
@@ -133,6 +156,8 @@ pub struct ManifestEntry {
     pub rel_path: String,
     pub content_hash: String,
     pub last_modified: u64,
+    #[serde(default)]
+    pub device_id: String,
     pub is_device_specific: bool,
 }
 
@@ -144,6 +169,7 @@ impl From<&ConfigItem> for ManifestEntry {
             rel_path: item.rel_path.clone(),
             content_hash: item.content_hash.clone(),
             last_modified: item.last_modified,
+            device_id: item.device_id.clone(),
             is_device_specific: item.is_device_specific,
         }
     }
@@ -185,17 +211,22 @@ pub struct ManifestDiffSummary {
     pub unchanged: usize,
 }
 
+/// A single upload candidate derived from manifest diff results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushPlanItem {
+    pub tool: Tool,
+    pub category: Category,
+    pub rel_path: String,
+    pub status: DiffStatus,
+}
+
 /// Compare local and remote manifests using tool/category/path identity plus metadata.
 pub fn diff_manifests(local: &SyncManifest, remote: &SyncManifest) -> Vec<ManifestDiffEntry> {
     type Key<'a> = (&'a str, &'a str, &'a str);
 
     let local_map = index_manifest_entries(&local.items);
     let remote_map = index_manifest_entries(&remote.items);
-    let keys: BTreeSet<Key> = local_map
-        .keys()
-        .chain(remote_map.keys())
-        .copied()
-        .collect();
+    let keys: BTreeSet<Key> = local_map.keys().chain(remote_map.keys()).copied().collect();
 
     let mut entries = Vec::with_capacity(keys.len());
     for key in keys {
@@ -208,6 +239,7 @@ pub fn diff_manifests(local: &SyncManifest, remote: &SyncManifest) -> Vec<Manife
             (Some(_), None) => DiffStatus::LocalOnly,
             (None, Some(_)) => DiffStatus::RemoteOnly,
             (Some(l), Some(r)) if is_same_manifest_entry(l, r) => DiffStatus::Unchanged,
+            (Some(l), Some(r)) if is_conflict_entry(&local.device_id, l, r) => DiffStatus::Conflict,
             (Some(_), Some(_)) => DiffStatus::Modified,
             (None, None) => unreachable!("diff key must exist in at least one manifest"),
         };
@@ -241,20 +273,38 @@ pub fn summarize_manifest_diff(entries: &[ManifestDiffEntry]) -> ManifestDiffSum
     summary
 }
 
+/// Build an incremental push plan from manifest diff results.
+pub fn build_push_plan(entries: &[ManifestDiffEntry]) -> Vec<PushPlanItem> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry.status {
+            DiffStatus::LocalOnly | DiffStatus::Modified => Some(PushPlanItem {
+                tool: entry.tool,
+                category: entry.category,
+                rel_path: entry.rel_path.clone(),
+                status: entry.status,
+            }),
+            DiffStatus::RemoteOnly | DiffStatus::Conflict | DiffStatus::Unchanged => None,
+        })
+        .collect()
+}
+
 fn compute_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-fn index_manifest_entries(
-    items: &[ManifestEntry],
-) -> BTreeMap<(&str, &str, &str), &ManifestEntry> {
+fn index_manifest_entries(items: &[ManifestEntry]) -> BTreeMap<(&str, &str, &str), &ManifestEntry> {
     items
         .iter()
         .map(|item| {
             (
-                (item.tool.as_str(), item.category.as_str(), item.rel_path.as_str()),
+                (
+                    item.tool.as_str(),
+                    item.category.as_str(),
+                    item.rel_path.as_str(),
+                ),
                 item,
             )
         })
@@ -265,36 +315,64 @@ fn is_same_manifest_entry(left: &ManifestEntry, right: &ManifestEntry) -> bool {
     left.content_hash == right.content_hash && left.is_device_specific == right.is_device_specific
 }
 
+fn is_conflict_entry(local_device_id: &str, _left: &ManifestEntry, right: &ManifestEntry) -> bool {
+    !right.device_id.is_empty() && right.device_id != local_device_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn item_with_device(
+        tool: Tool,
+        category: Category,
+        rel_path: &str,
+        content: &str,
+        last_modified: u64,
+        is_device_specific: bool,
+        device_id: &str,
+    ) -> ConfigItem {
+        let mut item = ConfigItem::new(
+            tool,
+            category,
+            rel_path.to_string(),
+            content.to_string(),
+            last_modified,
+            is_device_specific,
+        );
+        item.device_id = device_id.to_string();
+        item
+    }
+
     #[test]
     fn manifest_from_items_sorts_entries_and_preserves_metadata() {
         let items = vec![
-            ConfigItem::new(
+            item_with_device(
                 Tool::Codex,
                 Category::Rules,
-                "rules/z.rules".to_string(),
-                "z".to_string(),
+                "rules/z.rules",
+                "z",
                 30,
                 false,
+                "test-device",
             ),
-            ConfigItem::new(
+            item_with_device(
                 Tool::ClaudeCode,
                 Category::Commands,
-                "commands/a.md".to_string(),
-                "a".to_string(),
+                "commands/a.md",
+                "a",
                 10,
                 false,
+                "test-device",
             ),
-            ConfigItem::new(
+            item_with_device(
                 Tool::Codex,
                 Category::Rules,
-                "rules/a.rules".to_string(),
-                "b".to_string(),
+                "rules/a.rules",
+                "b",
                 20,
                 true,
+                "test-device",
             ),
         ];
 
@@ -313,6 +391,7 @@ mod tests {
         );
         assert!(manifest.items[1].is_device_specific);
         assert_eq!(manifest.items[2].content_hash, items[0].content_hash);
+        assert_eq!(manifest.items[0].device_id, "test-device");
     }
 
     #[test]
@@ -321,29 +400,32 @@ mod tests {
             "local".to_string(),
             100,
             &[
-                ConfigItem::new(
+                item_with_device(
                     Tool::Codex,
                     Category::Settings,
-                    "config.toml".to_string(),
-                    "same".to_string(),
+                    "config.toml",
+                    "same",
                     1,
                     false,
+                    "local",
                 ),
-                ConfigItem::new(
+                item_with_device(
                     Tool::Codex,
                     Category::Rules,
-                    "rules/local.rules".to_string(),
-                    "local-only".to_string(),
+                    "rules/local.rules",
+                    "local-only",
                     2,
                     false,
+                    "local",
                 ),
-                ConfigItem::new(
+                item_with_device(
                     Tool::Cursor,
                     Category::Commands,
-                    "commands/shared.md".to_string(),
-                    "local-version".to_string(),
+                    "commands/shared.md",
+                    "local-version",
                     3,
                     false,
+                    "local",
                 ),
             ],
         );
@@ -351,29 +433,32 @@ mod tests {
             "remote".to_string(),
             200,
             &[
-                ConfigItem::new(
+                item_with_device(
                     Tool::Codex,
                     Category::Settings,
-                    "config.toml".to_string(),
-                    "same".to_string(),
+                    "config.toml",
+                    "same",
                     5,
                     false,
+                    "local",
                 ),
-                ConfigItem::new(
+                item_with_device(
                     Tool::Cursor,
                     Category::Commands,
-                    "commands/shared.md".to_string(),
-                    "remote-version".to_string(),
+                    "commands/shared.md",
+                    "remote-version",
                     6,
                     false,
+                    "local",
                 ),
-                ConfigItem::new(
+                item_with_device(
                     Tool::SharedAgents,
                     Category::Skills,
-                    "skills/remote/SKILL.md".to_string(),
-                    "remote-only".to_string(),
+                    "skills/remote/SKILL.md",
+                    "remote-only",
                     7,
                     false,
+                    "remote",
                 ),
             ],
         );
@@ -408,5 +493,131 @@ mod tests {
         assert!(diff[0].remote.is_none());
         assert!(diff[1].local.is_some());
         assert!(diff[1].remote.is_some());
+    }
+
+    #[test]
+    fn build_push_plan_only_keeps_local_only_and_modified_entries() {
+        let local = SyncManifest::from_items(
+            "local".to_string(),
+            100,
+            &[
+                item_with_device(
+                    Tool::Codex,
+                    Category::Settings,
+                    "config.toml",
+                    "same",
+                    1,
+                    false,
+                    "local",
+                ),
+                item_with_device(
+                    Tool::Codex,
+                    Category::Rules,
+                    "rules/local.rules",
+                    "local-only",
+                    2,
+                    false,
+                    "local",
+                ),
+                item_with_device(
+                    Tool::Cursor,
+                    Category::Commands,
+                    "commands/shared.md",
+                    "local-version",
+                    3,
+                    false,
+                    "local",
+                ),
+            ],
+        );
+        let remote = SyncManifest::from_items(
+            "remote".to_string(),
+            200,
+            &[
+                item_with_device(
+                    Tool::Codex,
+                    Category::Settings,
+                    "config.toml",
+                    "same",
+                    5,
+                    false,
+                    "local",
+                ),
+                item_with_device(
+                    Tool::Cursor,
+                    Category::Commands,
+                    "commands/shared.md",
+                    "remote-version",
+                    6,
+                    false,
+                    "local",
+                ),
+                item_with_device(
+                    Tool::SharedAgents,
+                    Category::Skills,
+                    "skills/remote/SKILL.md",
+                    "remote-only",
+                    7,
+                    false,
+                    "remote",
+                ),
+            ],
+        );
+
+        let diff = diff_manifests(&local, &remote);
+        let plan = build_push_plan(&diff);
+
+        assert_eq!(
+            plan,
+            vec![
+                PushPlanItem {
+                    tool: Tool::Codex,
+                    category: Category::Rules,
+                    rel_path: "rules/local.rules".to_string(),
+                    status: DiffStatus::LocalOnly,
+                },
+                PushPlanItem {
+                    tool: Tool::Cursor,
+                    category: Category::Commands,
+                    rel_path: "commands/shared.md".to_string(),
+                    status: DiffStatus::Modified,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_manifests_marks_remote_changes_from_other_device_as_conflict() {
+        let local = SyncManifest::from_items(
+            "local-device".to_string(),
+            100,
+            &[item_with_device(
+                Tool::Codex,
+                Category::Settings,
+                "config.toml",
+                "local-version",
+                10,
+                false,
+                "local-device",
+            )],
+        );
+        let remote = SyncManifest::from_items(
+            "remote".to_string(),
+            200,
+            &[item_with_device(
+                Tool::Codex,
+                Category::Settings,
+                "config.toml",
+                "remote-version",
+                11,
+                false,
+                "other-device",
+            )],
+        );
+
+        let diff = diff_manifests(&local, &remote);
+
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].status, DiffStatus::Conflict);
     }
 }

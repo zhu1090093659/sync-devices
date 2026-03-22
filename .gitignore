@@ -5,3 +5,4 @@
 /worker/.dev.vars*
 !/worker/.dev.vars.example
 /worker/.env*
+.claude/settings.local.json
