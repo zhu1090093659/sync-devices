@@ -33,7 +33,12 @@ try {
             $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers @{ "User-Agent" = "sync-devices-installer" }
             $version = $release.tag_name
         } catch {
-            Write-Err "Failed to fetch latest version. Set `$env:SYNC_DEVICES_VERSION to install a specific version."
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            if ($statusCode -eq 404) {
+                Write-Err "No releases found for $repo. The project may not have published a release yet. Check https://github.com/$repo/releases"
+            } else {
+                Write-Err "Failed to fetch latest version (HTTP $statusCode). Set `$env:SYNC_DEVICES_VERSION to install a specific version."
+            }
         }
     }
 

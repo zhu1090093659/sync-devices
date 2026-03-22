@@ -85,8 +85,11 @@ fetch() {
 resolve_version() {
     if [ "$VERSION" = "latest" ]; then
         info "Fetching latest release version..."
-        VERSION=$(fetch "https://api.github.com/repos/${REPO}/releases/latest" \
-            | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        api_response=$(fetch "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null || echo "")
+        if echo "$api_response" | grep -q '"Not Found"'; then
+            error "No releases found for ${REPO}. The project may not have published a release yet.\n       Check https://github.com/${REPO}/releases"
+        fi
+        VERSION=$(echo "$api_response" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
         if [ -z "$VERSION" ]; then
             error "Failed to determine latest version. Set SYNC_DEVICES_VERSION to install a specific version."
         fi
