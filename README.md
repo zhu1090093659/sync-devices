@@ -2,7 +2,7 @@
 
 Cross-platform CLI tool for syncing AI CLI tool configurations across devices.
 
-Supports **Claude Code**, **Codex**, **Cursor**, and **shared agent skills** — keeping your settings, instructions, commands, skills, MCP configs, plugins, and rules in sync via a Cloudflare Workers + KV backend, authenticated through GitHub OAuth.
+Supports **Claude Code**, **Codex**, **Cursor**, and **shared agent skills** — keeping your settings, instructions, commands, skills, MCP configs, plugins, and rules in sync via a self-deployed Cloudflare Workers + KV backend, authenticated with your Cloudflare API Token.
 
 ## Features
 
@@ -60,35 +60,50 @@ cargo binstall sync-devices
 cargo install --path .
 ```
 
+## Prerequisites
+
+You need a Cloudflare account with a free Workers plan. Create an API Token at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) with the following permissions:
+
+- **Account > Workers Scripts > Edit**
+- **Account > Workers KV Storage > Edit**
+
 ## Quick Start
 
-1. **Login** with your GitHub account:
+1. **Login** with your Cloudflare API Token:
 
    ```bash
    sync-devices login
    ```
 
-   This opens the GitHub Device Flow — paste the code shown in your browser to authorize.
+   Paste your token when prompted (input is hidden).
 
-2. **Check status** to see local config items and remote diff:
+2. **Deploy** the Worker to your Cloudflare account:
+
+   ```bash
+   sync-devices setup
+   ```
+
+   This creates a KV namespace and deploys the sync Worker automatically.
+
+3. **Check status** to see local config items and remote diff:
 
    ```bash
    sync-devices status
    ```
 
-3. **Push** local changes to the cloud:
+4. **Push** local changes to the cloud:
 
    ```bash
    sync-devices push
    ```
 
-4. **Pull** remote changes to this device:
+5. **Pull** remote changes to this device:
 
    ```bash
    sync-devices pull
    ```
 
-5. **Open the TUI** for interactive management:
+6. **Open the TUI** for interactive management:
 
    ```bash
    sync-devices manage
@@ -98,12 +113,14 @@ cargo install --path .
 
 | Command | Description |
 |---------|-------------|
-| `login` | Authenticate via GitHub OAuth Device Flow |
+| `login` | Authenticate with a Cloudflare API Token |
+| `setup` | Deploy Worker and KV to your Cloudflare account |
 | `logout` | Clear stored credentials |
 | `push` | Upload local config changes to remote |
 | `pull` | Download remote-only configs to local |
-| `status` | Show local items and remote diff summary |
+| `status` | Show local items, Worker info, and remote diff |
 | `manage` | Open interactive TUI |
+| `teardown` | Remove Worker and KV from your Cloudflare account |
 
 ## TUI Keybindings
 
@@ -134,43 +151,31 @@ sync-devices (Rust CLI)
     |
     +-- sanitizer         Regex-based sensitive data detection and redaction
     +-- model             Data types, manifest diffing, push planning
-    +-- transport         HTTP client with retry logic, Bearer auth
-    +-- auth              GitHub OAuth Device Flow
+    +-- transport         HTTP client with retry, health check, Bearer auth
+    +-- auth              Cloudflare API Token verification
+    +-- cloudflare_api    CF REST API client (deploy Worker, manage KV)
     +-- session_store     Keyring-based credential persistence
+    +-- worker_bundle     Embedded Worker JS (include_str!)
     +-- tui               ratatui interactive interface
     |
     v
-Cloudflare Workers + KV (TypeScript / Hono)
-    +-- /api/session      Session validation
+Cloudflare Workers + KV (TypeScript / Hono, self-deployed)
+    +-- GET /             Worker self-description (version, kv_bound)
+    +-- GET /healthz      Health check
     +-- /api/manifest     Sync manifest (GET)
     +-- /api/configs      Config CRUD (GET/PUT/DELETE)
 ```
 
-## Backend Setup
+## Backend
 
-The backend runs on Cloudflare Workers with KV storage. See `worker/` for the TypeScript source.
-
-```bash
-cd worker
-npm install
-npx wrangler dev     # local development
-npx wrangler deploy  # production deployment
-```
-
-Required environment variables (set via `wrangler secret put`):
-
-- `GITHUB_CLIENT_ID` — GitHub OAuth App client ID
-- `GITHUB_CLIENT_SECRET` — GitHub OAuth App client secret
-- `JWT_SECRET` — secret for signing session JWTs
-
-Required KV namespaces (bind in `wrangler.toml`):
-
-- `SESSIONS` — session token storage
-- `CONFIGS` — synced configuration items
+The Worker is embedded in the CLI binary and deployed to your own Cloudflare account via `sync-devices setup`. No shared infrastructure, no third-party secrets. For manual Worker development see `worker/`.
 
 ## Development
 
 ```bash
+# Build the Worker bundle first (required before cargo build)
+cd worker && npm install && npm run build && cd ..
+
 # Build
 cargo build
 

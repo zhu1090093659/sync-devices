@@ -166,8 +166,8 @@ struct App {
     total_items: usize,
     remote_available: bool,
     device_id: String,
-    /// GitHub login name from stored session.
-    user_login: Option<String>,
+    /// Cloudflare account name from stored session.
+    account_name: Option<String>,
     /// Unique device IDs seen in remote records.
     known_devices: Vec<String>,
 
@@ -180,7 +180,7 @@ impl App {
         items: Vec<TreeItem>,
         remote_available: bool,
         device_id: String,
-        user_login: Option<String>,
+        account_name: Option<String>,
         known_devices: Vec<String>,
     ) -> Self {
         let total_items = items.len();
@@ -200,7 +200,7 @@ impl App {
             total_items,
             remote_available,
             device_id,
-            user_login,
+            account_name,
             known_devices,
             status_msg: None,
         };
@@ -416,8 +416,8 @@ impl App {
     fn open_devices(&mut self) {
         let mut lines = Vec::new();
         lines.push(format!("Current Device: {}", self.device_id));
-        if let Some(login) = &self.user_login {
-            lines.push(format!("GitHub User: @{}", login));
+        if let Some(name) = &self.account_name {
+            lines.push(format!("Account: {}", name));
         }
         lines.push(format!(
             "Remote: {}",
@@ -620,10 +620,8 @@ fn build_tree_items(
             }
         }
         Some(remote_data) => {
-            let all_keys: BTreeSet<&ItemKey> = local_map
-                .keys()
-                .chain(remote_data.records.keys())
-                .collect();
+            let all_keys: BTreeSet<&ItemKey> =
+                local_map.keys().chain(remote_data.records.keys()).collect();
 
             for key in all_keys {
                 let local = local_map.get(key);
@@ -736,9 +734,23 @@ fn build_diff_lines(item: &TreeItem) -> Vec<DiffLine> {
 // -- Push / Pull execution ----------------------------------------------------
 
 /// Push checked LocalOnly/Modified items to the remote.
-fn execute_push(items: &mut [TreeItem], client: &transport::ApiTransport, device_id: &str) -> String {
+fn execute_push(
+    items: &mut [TreeItem],
+    client: &transport::ApiTransport,
+    device_id: &str,
+) -> String {
     // Collect payloads before entering the async block.
-    let candidates: Vec<(usize, String, String, String, String, Option<String>, u64, bool)> = items
+    #[allow(clippy::type_complexity)]
+    let candidates: Vec<(
+        usize,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        u64,
+        bool,
+    )> = items
         .iter()
         .enumerate()
         .filter(|(_, item)| {
@@ -816,7 +828,10 @@ fn execute_pull(items: &mut [TreeItem]) -> String {
         .filter(|(_, item)| {
             item.checked
                 && item.remote_content.is_some()
-                && matches!(item.diff_status, Some(DiffStatus::RemoteOnly | DiffStatus::Conflict))
+                && matches!(
+                    item.diff_status,
+                    Some(DiffStatus::RemoteOnly | DiffStatus::Conflict)
+                )
         })
         .map(|(i, _)| i)
         .collect();
@@ -940,7 +955,9 @@ fn resolve_keep_remote(item: &mut TreeItem) -> String {
 
 /// Collect unique device IDs from remote records.
 fn collect_known_devices(remote: Option<&RemoteData>) -> Vec<String> {
-    let Some(data) = remote else { return Vec::new() };
+    let Some(data) = remote else {
+        return Vec::new();
+    };
     let mut devices: BTreeSet<String> = BTreeSet::new();
     for record in data.records.values() {
         if !record.device_id.is_empty() {
@@ -965,12 +982,7 @@ async fn load_remote_data() -> (Option<RemoteData>, Option<transport::ApiTranspo
 
     let records = records_list
         .into_iter()
-        .map(|r| {
-            (
-                (r.tool.clone(), r.category.clone(), r.rel_path.clone()),
-                r,
-            )
-        })
+        .map(|r| ((r.tool.clone(), r.category.clone(), r.rel_path.clone()), r))
         .collect();
 
     (Some(RemoteData { records }), Some(client))
@@ -987,11 +999,11 @@ pub async fn run_manage() -> Result<()> {
 
     // Collect known device IDs from remote records.
     let known_devices = collect_known_devices(remote.as_ref());
-    // Load user login from stored session.
-    let user_login = crate::session_store::SessionStore::new()
+    // Load account name from stored session.
+    let account_name = crate::session_store::SessionStore::new()
         .ok()
         .and_then(|store| store.load().ok().flatten())
-        .map(|s| s.user.login);
+        .map(|s| s.account_name);
 
     let mut terminal = setup_terminal()?;
     let result = run_app(
@@ -999,7 +1011,7 @@ pub async fn run_manage() -> Result<()> {
         tree_items,
         remote_available,
         device_id,
-        user_login,
+        account_name,
         known_devices,
         transport,
     );
@@ -1037,11 +1049,17 @@ fn run_app(
     items: Vec<TreeItem>,
     remote_available: bool,
     device_id: String,
-    user_login: Option<String>,
+    account_name: Option<String>,
     known_devices: Vec<String>,
     transport: Option<transport::ApiTransport>,
 ) -> Result<()> {
-    let mut app = App::new(items, remote_available, device_id, user_login, known_devices);
+    let mut app = App::new(
+        items,
+        remote_available,
+        device_id,
+        account_name,
+        known_devices,
+    );
     let mut page_size: usize = 20;
 
     while !app.should_quit {
@@ -1318,9 +1336,7 @@ fn render_diff(frame: &mut ratatui::Frame, app: &mut App) {
         .style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(header, sections[0]);
 
-    let body_block = Block::default()
-        .borders(Borders::ALL)
-        .title("Content Diff");
+    let body_block = Block::default().borders(Borders::ALL).title("Content Diff");
     let inner = body_block.inner(sections[1]);
     let vh = inner.height as usize;
 
@@ -1425,7 +1441,12 @@ fn render_devices(frame: &mut ratatui::Frame, app: &mut App) {
         .iter()
         .skip(scroll)
         .take(vh)
-        .map(|text| Line::from(Span::styled(text.clone(), Style::default().fg(Color::White))))
+        .map(|text| {
+            Line::from(Span::styled(
+                text.clone(),
+                Style::default().fg(Color::White),
+            ))
+        })
         .collect();
     let body = Paragraph::new(rendered).block(body_block);
     frame.render_widget(body, sections[1]);

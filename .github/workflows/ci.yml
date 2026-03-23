@@ -37,6 +37,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libdbus-1-dev
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Build Worker bundle
+        run: cd worker && npm ci && npm run build
+
       - name: Build
         run: cargo build --verbose
 
@@ -67,6 +77,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libdbus-1-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Build Worker bundle
+        run: cd worker && npm ci && npm run build
 
       - name: Run clippy
         run: cargo clippy -- -D warnings

@@ -196,7 +196,9 @@ pub struct ManifestDiffEntry {
     pub tool: Tool,
     pub category: Category,
     pub rel_path: String,
+    #[allow(dead_code)] // retained for future per-item diff display
     pub local: Option<ManifestEntry>,
+    #[allow(dead_code)] // retained for future per-item diff display
     pub remote: Option<ManifestEntry>,
     pub status: DiffStatus,
 }
