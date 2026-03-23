@@ -38,20 +38,21 @@ static PATTERNS: LazyLock<Vec<SensitivePattern>> = LazyLock::new(|| {
 
 /// Result of scanning content for sensitive data
 #[derive(Debug)]
+#[allow(dead_code)] // used in tests
 pub struct ScanResult {
-    /// Whether sensitive data was found
     pub has_sensitive: bool,
-    /// List of detected sensitive patterns
     pub findings: Vec<Finding>,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // used in tests
 pub struct Finding {
     pub label: String,
     pub line: usize,
 }
 
 /// Scan content for sensitive patterns without modifying it
+#[allow(dead_code)] // used in tests
 pub fn scan(content: &str) -> ScanResult {
     let mut findings = Vec::new();
 
@@ -144,7 +145,8 @@ mod tests {
 
     #[test]
     fn test_detects_base64_secret() {
-        let content = "secret = \"dGhpc0lzQVZlcnlMb25nQmFzZTY0U2VjcmV0S2V5VGhhdFNob3VsZEJlRGV0ZWN0ZWQ=\"";
+        let content =
+            "secret = \"dGhpc0lzQVZlcnlMb25nQmFzZTY0U2VjcmV0S2V5VGhhdFNob3VsZEJlRGV0ZWN0ZWQ=\"";
         let result = scan(content);
         assert!(result.has_sensitive);
         assert!(result.findings.iter().any(|f| f.label == "base64_secret"));

@@ -11,12 +11,14 @@
     "predeploy:dry-run": "npm run deploy:check",
     "kv:create": "wrangler kv namespace create sync-devices-configs --binding SYNC_CONFIGS --update-config",
     "kv:create:preview": "wrangler kv namespace create sync-devices-configs-preview --binding SYNC_CONFIGS --preview --update-config",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild src/index.ts --bundle --format=esm --outfile=dist/worker.js --minify --target=es2022"
   },
   "dependencies": {
     "hono": "^4.0.0"
   },
   "devDependencies": {
+    "esbuild": "^0.24.0",
     "typescript": "^5.0.0",
     "wrangler": "^4.0.0"
   }

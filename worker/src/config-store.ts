@@ -1,4 +1,9 @@
-import { ConfigurationError, type Env } from "./github-oauth";
+import {
+  ConfigurationError,
+  type Env,
+  type KVNamespaceLike,
+  type ListKey,
+} from "./auth";
 
 const VALID_TOOLS = [
   "claude_code",
@@ -16,19 +21,10 @@ const VALID_CATEGORIES = [
   "rules",
 ] as const;
 const CONFIG_KEY_PREFIX = "configs";
+const BATCH_GET_SIZE = 25;
 
 type ToolName = (typeof VALID_TOOLS)[number];
 type CategoryName = (typeof VALID_CATEGORIES)[number];
-
-interface ListKey {
-  name: string;
-}
-
-interface ListResult {
-  keys: ListKey[];
-  list_complete: boolean;
-  cursor?: string;
-}
 
 export interface ConfigUploadPayload {
   content: string;
@@ -117,7 +113,17 @@ export async function saveConfigRecord(
     normalizedPath,
   );
   const store = requireConfigStore(env);
-  await store.put(key, JSON.stringify(record));
+  await store.put(key, JSON.stringify(record), {
+    metadata: {
+      tool: record.tool,
+      category: record.category,
+      rel_path: record.rel_path,
+      content_hash: record.content_hash,
+      last_modified: record.last_modified,
+      device_id: record.device_id,
+      is_device_specific: record.is_device_specific,
+    },
+  });
   return record;
 }
 
@@ -135,37 +141,35 @@ export async function listConfigRecords(
     validatedCategory,
   );
 
-  const records: StoredConfigRecord[] = [];
+  const allKeys: string[] = [];
   let cursor: string | undefined;
 
   do {
-    const result = await store.list({
-      prefix,
-      cursor,
-    });
+    const result = await store.list({ prefix, cursor });
+    for (const key of result.keys) {
+      allKeys.push(key.name);
+    }
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
 
-    const batch = await Promise.all(
-      result.keys.map((key) => store.get<StoredConfigRecord>(key.name, "json")),
-    );
+  const records: StoredConfigRecord[] = [];
+  const batches = batchGet(store, allKeys, BATCH_GET_SIZE);
 
-    for (const record of batch) {
+  for (const batch of batches) {
+    const results = await Promise.all(batch);
+    for (const record of results) {
       if (!record) {
         continue;
       }
-
       if (validatedTool && record.tool !== validatedTool) {
         continue;
       }
-
       if (validatedCategory && record.category !== validatedCategory) {
         continue;
       }
-
       records.push(record);
     }
-
-    cursor = result.list_complete ? undefined : result.cursor;
-  } while (cursor);
+  }
 
   return records.sort(compareConfigRecords);
 }
@@ -174,11 +178,28 @@ export async function getConfigManifest(
   env: Env,
   ownerSubject: string,
 ): Promise<SyncManifestRecord> {
-  const records = await listConfigRecords(env, ownerSubject, {});
+  const store = requireConfigStore(env);
+  const prefix = buildListPrefix(ownerSubject, null, null);
+  const items: ManifestEntryRecord[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const result = await store.list({ prefix, cursor });
+    for (const key of result.keys) {
+      const entry = extractManifestEntryFromMetadata(key);
+      if (entry) {
+        items.push(entry);
+      }
+    }
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
+
+  items.sort(compareManifestEntries);
+
   return {
     device_id: buildRemoteManifestId(ownerSubject),
     generated_at: Math.floor(Date.now() / 1000),
-    items: records.map(toManifestEntry),
+    items,
   };
 }
 
@@ -241,6 +262,64 @@ export function extractRelativePath(
   }
 
   return pathname.slice(prefix.length);
+}
+
+function batchGet(
+  store: KVNamespaceLike,
+  keys: string[],
+  batchSize: number,
+): Array<Array<Promise<StoredConfigRecord | null>>> {
+  const batches: Array<Array<Promise<StoredConfigRecord | null>>> = [];
+  for (let i = 0; i < keys.length; i += batchSize) {
+    const chunk = keys.slice(i, i + batchSize);
+    batches.push(
+      chunk.map((key) => store.get<StoredConfigRecord>(key, "json")),
+    );
+  }
+  return batches;
+}
+
+function extractManifestEntryFromMetadata(
+  key: ListKey,
+): ManifestEntryRecord | null {
+  const meta = key.metadata;
+  if (!meta) {
+    return null;
+  }
+
+  const tool = meta.tool;
+  const category = meta.category;
+  const relPath = meta.rel_path;
+  const contentHash = meta.content_hash;
+  const lastModified = meta.last_modified;
+  const deviceId = meta.device_id;
+  const isDeviceSpecific = meta.is_device_specific;
+
+  if (
+    typeof tool !== "string" ||
+    typeof category !== "string" ||
+    typeof relPath !== "string" ||
+    typeof contentHash !== "string" ||
+    typeof lastModified !== "number" ||
+    typeof deviceId !== "string" ||
+    typeof isDeviceSpecific !== "boolean"
+  ) {
+    return null;
+  }
+
+  if (!isToolName(tool) || !isCategoryName(category)) {
+    return null;
+  }
+
+  return {
+    tool,
+    category,
+    rel_path: relPath,
+    content_hash: contentHash,
+    last_modified: lastModified,
+    device_id: deviceId,
+    is_device_specific: isDeviceSpecific,
+  };
 }
 
 function validateTool(value: string): ToolName {
@@ -431,24 +510,12 @@ function buildListPrefix(
   return `${prefix}${category}:`;
 }
 
-function requireConfigStore(env: Env) {
+function requireConfigStore(env: Env): KVNamespaceLike {
   if (!env.SYNC_CONFIGS) {
     throw new ConfigurationError("Missing SYNC_CONFIGS KV binding.");
   }
 
   return env.SYNC_CONFIGS;
-}
-
-function toManifestEntry(record: StoredConfigRecord): ManifestEntryRecord {
-  return {
-    tool: record.tool,
-    category: record.category,
-    rel_path: record.rel_path,
-    content_hash: record.content_hash,
-    last_modified: record.last_modified,
-    device_id: record.device_id,
-    is_device_specific: record.is_device_specific,
-  };
 }
 
 function buildRemoteManifestId(ownerSubject: string): string {
@@ -458,6 +525,21 @@ function buildRemoteManifestId(ownerSubject: string): string {
 function compareConfigRecords(
   a: StoredConfigRecord,
   b: StoredConfigRecord,
+): number {
+  if (a.tool !== b.tool) {
+    return a.tool.localeCompare(b.tool);
+  }
+
+  if (a.category !== b.category) {
+    return a.category.localeCompare(b.category);
+  }
+
+  return a.rel_path.localeCompare(b.rel_path);
+}
+
+function compareManifestEntries(
+  a: ManifestEntryRecord,
+  b: ManifestEntryRecord,
 ): number {
   if (a.tool !== b.tool) {
     return a.tool.localeCompare(b.tool);

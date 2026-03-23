@@ -1,4 +1,3 @@
-use crate::auth::SessionUser;
 use crate::model::SyncManifest;
 use crate::session_store::{SessionStore, SessionStoreError, StoredSession};
 use reqwest::{Client, Method, Response, StatusCode, Url};
@@ -10,27 +9,13 @@ use tokio::time::sleep;
 
 const MAX_ATTEMPTS: usize = 2;
 const RETRY_DELAY_MS: u64 = 300;
-const CONNECT_TIMEOUT_SECS: u64 = 5;
-const REQUEST_TIMEOUT_SECS: u64 = 15;
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub struct ApiTransport {
     http: Client,
     base_url: Url,
     session: StoredSession,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SessionResponse {
-    pub user: SessionUser,
-    pub token: SessionMetadata,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SessionMetadata {
-    pub issuer: Option<String>,
-    pub subject: Option<String>,
-    pub issued_at: Option<u64>,
-    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,6 +67,8 @@ struct ConfigItemResponse {
 pub enum TransportError {
     #[error("No stored session found. Run `sync-devices login` first.")]
     MissingSession,
+    #[error("Worker not configured. Run `sync-devices setup` first.")]
+    MissingWorkerUrl,
     #[error(transparent)]
     SessionStore(#[from] SessionStoreError),
     #[error("HTTP client initialization failed: {0}")]
@@ -98,7 +85,11 @@ impl ApiTransport {
     pub fn from_session_store() -> Result<Self, TransportError> {
         let store = SessionStore::new()?;
         let session = store.load()?.ok_or(TransportError::MissingSession)?;
-        let base_url = Url::parse(&session.api_base_url)
+        let worker_url = session
+            .worker_url
+            .as_deref()
+            .ok_or(TransportError::MissingWorkerUrl)?;
+        let base_url = Url::parse(worker_url)
             .map_err(|error| TransportError::InvalidBaseUrl(error.to_string()))?;
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
@@ -113,9 +104,26 @@ impl ApiTransport {
         })
     }
 
-    pub async fn get_session(&self) -> Result<SessionResponse, TransportError> {
-        self.send_json(Method::GET, self.api_url("api/session")?, None::<&()>)
-            .await
+    /// Quick health check against the Worker's /healthz endpoint.
+    /// Returns a friendly error if the Worker is unreachable.
+    pub async fn check_health(&self) -> Result<(), TransportError> {
+        let url = self
+            .base_url
+            .join("healthz")
+            .map_err(|e| TransportError::InvalidBaseUrl(e.to_string()))?;
+        let response = self.http.get(url).send().await.map_err(|_| {
+            TransportError::Api {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "Worker is not responding. Check your deployment with `sync-devices status` or re-run `sync-devices setup`.".into(),
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(TransportError::Api {
+                status: response.status(),
+                message: "Worker health check failed.".into(),
+            });
+        }
+        Ok(())
     }
 
     pub async fn get_manifest(&self) -> Result<SyncManifest, TransportError> {
@@ -168,6 +176,7 @@ impl ApiTransport {
         Ok(response.item)
     }
 
+    #[allow(dead_code)] // used in ignored live integration test
     pub async fn delete_config(&self, id: &str) -> Result<RemoteConfigRecord, TransportError> {
         let url = self.api_url(&format!("api/configs/{id}"))?;
         let response: ConfigItemResponse = self.send_json(Method::DELETE, url, None::<&()>).await?;
@@ -201,13 +210,22 @@ impl ApiTransport {
             let mut request = self
                 .http
                 .request(method.clone(), url.clone())
-                .bearer_auth(&self.session.access_token);
+                .bearer_auth(&self.session.api_token);
 
             if let Some(payload) = body {
                 request = request.json(payload);
             }
 
-            let response = request.send().await?;
+            let response = match request.send().await {
+                Ok(r) => r,
+                Err(err) if err.is_connect() || err.is_timeout() => {
+                    return Err(TransportError::Api {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "Worker is not responding. Check your deployment with `sync-devices status` or re-run `sync-devices setup`.".into(),
+                    });
+                }
+                Err(err) => return Err(err.into()),
+            };
             if response.status().is_success() {
                 return Ok(response);
             }
@@ -218,7 +236,8 @@ impl ApiTransport {
             }
 
             let status = response.status();
-            let message = read_error_message(response).await?;
+            let raw_message = read_error_message(response).await?;
+            let message = enhance_error_message(status, &raw_message);
             return Err(TransportError::Api { status, message });
         }
 
@@ -238,22 +257,14 @@ impl ApiTransport {
         let http = Client::builder()
             .build()
             .map_err(TransportError::ClientBuild)?;
-        let api_base_url = base_url.to_string();
         Ok(Self {
             http,
-            base_url,
+            base_url: base_url.clone(),
             session: StoredSession {
-                access_token: token.to_string(),
-                token_type: "bearer".to_string(),
-                scope: String::new(),
-                expires_in: 3600,
-                api_base_url,
-                user: SessionUser {
-                    id: 0,
-                    login: "test-user".to_string(),
-                    name: None,
-                    avatar_url: String::new(),
-                },
+                api_token: token.to_string(),
+                account_id: "test-account".to_string(),
+                account_name: "Test".to_string(),
+                worker_url: Some(base_url.to_string()),
                 stored_at: 0,
             },
         })
@@ -262,6 +273,20 @@ impl ApiTransport {
 
 fn should_retry(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn enhance_error_message(status: StatusCode, raw: &str) -> String {
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            format!("{raw} -- API token may be expired or invalid. Run `sync-devices login` to re-authenticate.")
+        }
+        StatusCode::INTERNAL_SERVER_ERROR
+            if raw.contains("SYNC_CONFIGS") || raw.contains("server_not_configured") =>
+        {
+            format!("{raw} -- KV namespace may not be bound. Run `sync-devices setup` to redeploy.")
+        }
+        _ => raw.to_string(),
+    }
 }
 
 async fn read_error_message(response: Response) -> Result<String, TransportError> {
@@ -280,12 +305,9 @@ async fn read_error_message(response: Response) -> Result<String, TransportError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use wiremock::matchers::{bearer_token, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const LIVE_POLL_ATTEMPTS: usize = 20;
-    const LIVE_POLL_DELAY_MS: u64 = 500;
     const TEST_TOKEN: &str = "test-token-abc123";
 
     #[tokio::test]
@@ -343,7 +365,6 @@ mod tests {
             .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "codex:settings:config.toml");
-        assert_eq!(records[0].content, "data = true");
     }
 
     #[tokio::test]
@@ -439,99 +460,88 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a stored session and live backend access"]
-    async fn live_roundtrip_config_api() -> Result<(), Box<dyn std::error::Error>> {
-        if std::env::var("SYNC_DEVICES_RUN_LIVE_TESTS").as_deref() != Ok("1") {
-            return Ok(());
-        }
+    async fn check_health_succeeds_when_worker_responds_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/healthz"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
 
-        let client = ApiTransport::from_session_store()?;
-        let session = client.get_session().await?;
-        assert!(!session.user.login.is_empty());
-
-        delete_smoke_configs(&client).await?;
-        let manifest_before = client.get_manifest().await?;
-        let _ = manifest_before.items.len();
-        let listed_before = client.list_configs(ConfigListFilters::default()).await?;
-        let _ = listed_before.len();
-
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let rel_path = format!("transport-smoke/{}.json", now.as_millis());
-        let created = client
-            .upload_config(
-                "codex",
-                "settings",
-                &rel_path,
-                &ConfigUploadRequest {
-                    content: "{\"transport\":\"ok\"}".to_string(),
-                    content_hash: None,
-                    last_modified: now.as_secs(),
-                    device_id: Some("transport-smoke".to_string()),
-                    is_device_specific: Some(false),
-                },
-            )
-            .await?;
-        assert_eq!(created.tool, "codex");
-        assert_eq!(created.category, "settings");
-        assert_eq!(created.rel_path, rel_path);
-
-        let manifest_after_upload = client.get_manifest().await?;
-        let _ = manifest_after_upload.items.len();
-        let listed_after_upload = client.list_configs(ConfigListFilters::default()).await?;
-        let _ = listed_after_upload.len();
-
-        let deleted = delete_config_with_retry(&client, &created.id).await?;
-        assert_eq!(deleted.id, created.id);
-
-        let manifest_after_delete = client.get_manifest().await?;
-        let _ = manifest_after_delete.items.len();
-        let listed_after_delete = client.list_configs(ConfigListFilters::default()).await?;
-        let _ = listed_after_delete.len();
-
-        Ok(())
+        let client = ApiTransport::new_for_test(&server.uri(), TEST_TOKEN).unwrap();
+        client.check_health().await.unwrap();
     }
 
-    async fn delete_smoke_configs(client: &ApiTransport) -> Result<(), Box<dyn std::error::Error>> {
-        let existing = list_smoke_configs(client).await?;
-        for config in existing {
-            delete_config_with_retry(client, &config.id).await?;
-        }
+    #[tokio::test]
+    async fn check_health_fails_on_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/healthz"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
 
-        Ok(())
-    }
-
-    async fn delete_config_with_retry(
-        client: &ApiTransport,
-        config_id: &str,
-    ) -> Result<RemoteConfigRecord, Box<dyn std::error::Error>> {
-        for attempt in 0..LIVE_POLL_ATTEMPTS {
-            match client.delete_config(config_id).await {
-                Ok(record) => return Ok(record),
-                Err(TransportError::Api { status, .. })
-                    if status == StatusCode::NOT_FOUND && attempt + 1 < LIVE_POLL_ATTEMPTS =>
-                {
-                    sleep(Duration::from_millis(LIVE_POLL_DELAY_MS)).await;
-                }
-                Err(error) => return Err(error.into()),
+        let client = ApiTransport::new_for_test(&server.uri(), TEST_TOKEN).unwrap();
+        let err = client.check_health().await.unwrap_err();
+        match err {
+            TransportError::Api { status, .. } => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
             }
+            other => panic!("expected Api error, got: {:?}", other),
         }
-
-        Err(format!("timed out deleting smoke config {config_id}").into())
     }
 
-    async fn list_smoke_configs(
-        client: &ApiTransport,
-    ) -> Result<Vec<RemoteConfigRecord>, TransportError> {
-        let configs = client
-            .list_configs(ConfigListFilters {
-                tool: Some("codex".to_string()),
-                category: Some("settings".to_string()),
-            })
-            .await?;
+    #[tokio::test]
+    async fn unauthorized_error_includes_re_login_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/manifest"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "unauthorized",
+                "error_description": "Token verification failed."
+            })))
+            .mount(&server)
+            .await;
 
-        Ok(configs
-            .into_iter()
-            .filter(|config| config.rel_path.starts_with("transport-smoke/"))
-            .collect())
+        let client = ApiTransport::new_for_test(&server.uri(), "expired-token").unwrap();
+        let err = client.get_manifest().await.unwrap_err();
+        match err {
+            TransportError::Api { status, message } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert!(
+                    message.contains("login"),
+                    "expected login hint in: {}",
+                    message
+                );
+            }
+            other => panic!("expected Api error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_error_with_kv_hint_includes_setup_suggestion() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/manifest"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": "server_not_configured",
+                "error_description": "Missing SYNC_CONFIGS KV binding."
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ApiTransport::new_for_test(&server.uri(), TEST_TOKEN).unwrap();
+        let err = client.get_manifest().await.unwrap_err();
+        match err {
+            TransportError::Api { status, message } => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(
+                    message.contains("setup"),
+                    "expected setup hint in: {}",
+                    message
+                );
+            }
+            other => panic!("expected Api error, got: {:?}", other),
+        }
     }
 }

@@ -1,16 +1,19 @@
 mod adapter;
 mod auth;
+mod cloudflare_api;
 mod model;
 mod sanitizer;
 mod session_store;
 mod transport;
 mod tui;
+mod worker_bundle;
 
 use crate::model::{ConfigItem, DiffStatus};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,10 +30,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Login via GitHub OAuth
+    /// Login with a Cloudflare API Token
     Login,
     /// Logout and clear stored credentials
     Logout,
+    /// Deploy Worker and KV to your Cloudflare account
+    Setup,
+    /// Remove Worker and KV from your Cloudflare account
+    Teardown,
     /// Push local configurations to the cloud
     Push,
     /// Pull configurations from the cloud
@@ -57,6 +64,7 @@ struct PushSummary {
 #[derive(Debug)]
 struct PushResult {
     summary: PushSummary,
+    #[allow(dead_code)] // used in ignored live integration test
     uploaded_records: Vec<transport::RemoteConfigRecord>,
 }
 
@@ -82,34 +90,28 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Login => {
-            let client = auth::DeviceFlowClient::from_env()?;
-            let device_code = client.request_device_code().await?;
+            println!("Paste your Cloudflare API Token (input is hidden):");
+            let api_token = read_hidden_line()?;
+            if api_token.is_empty() {
+                return Err(anyhow!("API token must not be empty."));
+            }
 
-            println!("Open this URL in your browser:");
-            println!("  {}", device_code.verification_uri);
-            println!();
-            println!("Enter this device code:");
-            println!("  {}", device_code.user_code);
-            println!();
-            println!("Waiting for authorization via {} ...", client.base_url());
+            println!("Verifying token...");
+            let account = auth::verify_cf_token(&api_token).await?;
 
-            let session = client.poll_for_session_token(&device_code).await?;
             let store = session_store::SessionStore::new()?;
-            store.save(client.base_url().as_str(), &session)?;
+            store.save(&account, &api_token, None)?;
 
             println!("Login succeeded.");
-            println!("User: @{}", session.user.login);
-            if let Some(name) = &session.user.name {
-                println!("Name: {}", name);
-            }
-            println!("User ID: {}", session.user.id);
-            println!("Avatar URL: {}", session.user.avatar_url);
-            println!("Token type: {}", session.token_type);
-            println!("Expires in: {} seconds", session.expires_in);
-            if !session.scope.is_empty() {
-                println!("Scope: {}", session.scope);
-            }
-            println!("Session token stored securely in the system keyring.");
+            println!("Account: {} ({})", account.account_name, account.account_id);
+            println!("Token stored securely in the system keyring.");
+            println!("Run `sync-devices setup` to deploy your Worker.");
+        }
+        Commands::Setup => {
+            run_setup().await?;
+        }
+        Commands::Teardown => {
+            run_teardown().await?;
         }
         Commands::Logout => {
             let store = session_store::SessionStore::new()?;
@@ -207,9 +209,43 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // Show session and Worker deployment info
+            let store = session_store::SessionStore::new()?;
+            match store.load()? {
+                Some(session) => {
+                    println!();
+                    println!("Account: {} ({})", session.account_name, session.account_id);
+                    match &session.worker_url {
+                        Some(url) if !url.is_empty() => {
+                            println!("Worker URL: {}", url);
+                            // Try to fetch Worker self-description
+                            if let Ok(resp) = reqwest::get(url).await {
+                                if let Ok(info) = resp.json::<serde_json::Value>().await {
+                                    if let Some(version) =
+                                        info.get("version").and_then(|v| v.as_str())
+                                    {
+                                        println!("Worker version: {}", version);
+                                    }
+                                    if let Some(kv) = info.get("kv_bound").and_then(|v| v.as_bool())
+                                    {
+                                        println!("KV bound: {}", kv);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("Worker: not deployed. Run `sync-devices setup` to deploy.");
+                        }
+                    }
+                }
+                None => {
+                    println!();
+                    println!("Not logged in. Run `sync-devices login` first.");
+                }
+            }
+
             match transport::ApiTransport::from_session_store() {
                 Ok(client) => {
-                    let session = client.get_session().await?;
                     let remote_manifest = client.get_manifest().await?;
                     let configs = client
                         .list_configs(transport::ConfigListFilters::default())
@@ -217,24 +253,16 @@ async fn main() -> Result<()> {
                     let diff = model::diff_manifests(&local_manifest, &remote_manifest);
                     let diff_summary = model::summarize_manifest_diff(&diff);
                     println!();
-                    println!("Remote session:");
-                    println!("  User: @{}", session.user.login);
-                    if let Some(subject) = session.token.subject {
-                        println!("  Subject: {}", subject);
-                    }
-                    println!("Remote manifest items: {}", remote_manifest.items.len());
                     println!("Remote config records: {}", configs.len());
-                    println!("Manifest diff summary:");
+                    println!("Manifest diff:");
                     println!("  Local only: {}", diff_summary.local_only);
                     println!("  Remote only: {}", diff_summary.remote_only);
                     println!("  Modified: {}", diff_summary.modified);
                     println!("  Conflict: {}", diff_summary.conflict);
                     println!("  Unchanged: {}", diff_summary.unchanged);
                 }
-                Err(transport::TransportError::MissingSession) => {
-                    println!();
-                    println!("Remote session unavailable: not logged in.");
-                }
+                Err(transport::TransportError::MissingSession)
+                | Err(transport::TransportError::MissingWorkerUrl) => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -251,6 +279,7 @@ async fn main() -> Result<()> {
 
 async fn push_local_changes(local_snapshot: &adapter::LocalSnapshot) -> Result<PushResult> {
     let client = transport::ApiTransport::from_session_store()?;
+    client.check_health().await?;
     let remote_manifest = client.get_manifest().await?;
     let diff = model::diff_manifests(&local_snapshot.manifest, &remote_manifest);
     let push_plan = model::build_push_plan(&diff);
@@ -315,6 +344,7 @@ async fn push_local_changes(local_snapshot: &adapter::LocalSnapshot) -> Result<P
 
 async fn pull_remote_changes(local_snapshot: &adapter::LocalSnapshot) -> Result<PullSummary> {
     let client = transport::ApiTransport::from_session_store()?;
+    client.check_health().await?;
     let remote_manifest = client.get_manifest().await?;
     let diff = model::diff_manifests(&local_snapshot.manifest, &remote_manifest);
     let remote_only = diff
@@ -520,11 +550,145 @@ fn index_config_items(items: &[ConfigItem]) -> BTreeMap<(String, String, String)
         .collect()
 }
 
+const WORKER_SCRIPT_NAME: &str = "sync-devices-worker";
+const KV_NAMESPACE_TITLE: &str = "sync-devices-configs";
+const KV_BINDING_NAME: &str = "SYNC_CONFIGS";
+
+async fn run_setup() -> Result<()> {
+    // Step 1: Load existing session
+    let store = session_store::SessionStore::new()?;
+    let session = store
+        .load()?
+        .ok_or_else(|| anyhow!("Not logged in. Run `sync-devices login` first."))?;
+
+    let cf = cloudflare_api::CloudflareApiClient::new(&session.api_token, &session.account_id);
+
+    // Step 2: Create or find KV namespace
+    println!("Creating KV namespace...");
+    let (kv_ns, kv_created) = cf.ensure_kv_namespace(KV_NAMESPACE_TITLE).await?;
+    if kv_created {
+        println!("  Created KV namespace: {} ({})", kv_ns.title, kv_ns.id);
+    } else {
+        println!(
+            "  KV namespace already exists: {} ({})",
+            kv_ns.title, kv_ns.id
+        );
+    }
+
+    // Step 3: Deploy Worker script with KV binding
+    println!("Deploying Worker script...");
+    cf.deploy_worker(
+        WORKER_SCRIPT_NAME,
+        worker_bundle::WORKER_JS,
+        &kv_ns.id,
+        KV_BINDING_NAME,
+    )
+    .await?;
+    println!("  Worker deployed: {}", WORKER_SCRIPT_NAME);
+
+    // Step 4: Enable workers.dev route
+    println!("Enabling workers.dev route...");
+    cf.enable_workers_dev_route(WORKER_SCRIPT_NAME).await?;
+
+    // Step 5: Resolve Worker URL
+    let worker_url = cf.resolve_worker_url(WORKER_SCRIPT_NAME).await?;
+    println!("  Worker URL: {}", worker_url);
+
+    // Step 6: Verify deployment by calling GET /
+    println!("Verifying deployment...");
+    let verify_resp = reqwest::get(&worker_url).await;
+    match verify_resp {
+        Ok(resp) if resp.status().is_success() => {
+            println!("  Worker is responding.");
+        }
+        Ok(resp) => {
+            println!(
+                "  Warning: Worker responded with status {}. It may need a moment to propagate.",
+                resp.status()
+            );
+        }
+        Err(err) => {
+            println!(
+                "  Warning: Could not reach Worker ({}). It may need a moment to propagate.",
+                err
+            );
+        }
+    }
+
+    // Step 7: Save Worker URL to session
+    store.set_worker_url(&worker_url)?;
+    println!("  Worker URL saved to session.");
+
+    println!("\nSetup complete. You can now use `sync-devices push` and `sync-devices pull`.");
+    Ok(())
+}
+
+async fn run_teardown() -> Result<()> {
+    let store = session_store::SessionStore::new()?;
+    let session = store
+        .load()?
+        .ok_or_else(|| anyhow!("Not logged in. Run `sync-devices login` first."))?;
+
+    let cf = cloudflare_api::CloudflareApiClient::new(&session.api_token, &session.account_id);
+
+    // Show what will be deleted
+    println!("The following resources will be deleted from your Cloudflare account:");
+    println!("  Worker script: {}", WORKER_SCRIPT_NAME);
+    println!("  KV namespace:  {}", KV_NAMESPACE_TITLE);
+    if let Some(url) = &session.worker_url {
+        println!("  Worker URL:    {}", url);
+    }
+    println!();
+    println!("All synced configuration data in KV will be permanently lost.");
+    println!("Type 'yes' to confirm:");
+
+    let confirmation = read_hidden_line()?;
+    if confirmation != "yes" {
+        println!("Teardown cancelled.");
+        return Ok(());
+    }
+
+    // Delete Worker script first (it depends on the KV binding)
+    println!("Deleting Worker script...");
+    match cf.delete_worker(WORKER_SCRIPT_NAME).await {
+        Ok(()) => println!("  Worker deleted."),
+        Err(cloudflare_api::CloudflareApiError::Api { code: 10007, .. }) => {
+            println!("  Worker not found (already deleted).");
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    // Delete KV namespace
+    println!("Deleting KV namespace...");
+    match cf.find_kv_namespace(KV_NAMESPACE_TITLE).await? {
+        Some(ns) => {
+            cf.delete_kv_namespace(&ns.id).await?;
+            println!("  KV namespace deleted: {}", ns.id);
+        }
+        None => {
+            println!("  KV namespace not found (already deleted).");
+        }
+    }
+
+    // Clear worker_url from session
+    store.set_worker_url("")?;
+    println!("\nTeardown complete. Worker and KV namespace have been removed.");
+    Ok(())
+}
+
 fn is_missing_session_error(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<transport::TransportError>(),
         Some(transport::TransportError::MissingSession)
     )
+}
+
+fn read_hidden_line() -> Result<String> {
+    // Flush prompt so it appears before reading
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }
 
 #[cfg(test)]

@@ -74,6 +74,7 @@ pub(crate) fn read_config_item(
 }
 
 /// Recursively scan a directory for config files matching an extension.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_dir_recursive(
     tool: Tool,
     dir: &Path,
@@ -137,11 +138,6 @@ pub fn build_local_snapshot(items: &[ConfigItem]) -> Result<LocalSnapshot> {
         device_id,
         generated_at,
     ))
-}
-
-/// Build a local manifest from scanned config items.
-pub fn build_local_manifest(items: &[ConfigItem]) -> Result<SyncManifest> {
-    Ok(build_local_snapshot(items)?.manifest)
 }
 
 /// Resolve the local filesystem path for a sync item.
@@ -282,7 +278,10 @@ mod tests {
         let root = PathBuf::from("C:/temp/root");
         let result = resolve_local_path_from_root(&root, "skills/my-skill/SKILL.md").unwrap();
 
-        assert_eq!(result, PathBuf::from("C:/temp/root/skills/my-skill/SKILL.md"));
+        assert_eq!(
+            result,
+            PathBuf::from("C:/temp/root/skills/my-skill/SKILL.md")
+        );
     }
 
     #[test]
@@ -309,7 +308,10 @@ mod tests {
             assert_eq!(config_root(Tool::ClaudeCode).unwrap(), home.join(".claude"));
             assert_eq!(config_root(Tool::Codex).unwrap(), home.join(".codex"));
             assert_eq!(config_root(Tool::Cursor).unwrap(), home.join(".cursor"));
-            assert_eq!(config_root(Tool::SharedAgents).unwrap(), home.join(".agents"));
+            assert_eq!(
+                config_root(Tool::SharedAgents).unwrap(),
+                home.join(".agents")
+            );
         }
     }
 
