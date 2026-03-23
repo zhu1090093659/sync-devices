@@ -11,6 +11,7 @@ mod worker_bundle;
 use crate::model::{ConfigItem, DiffStatus};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -139,7 +140,7 @@ async fn main() -> Result<()> {
             }
 
             println!(
-                "Preparing to push {} item(s) from device {}.",
+                "Pushed {} item(s) from device {}.",
                 summary.uploaded, local_snapshot.manifest.device_id
             );
             println!("  New: {}", summary.created);
@@ -147,8 +148,6 @@ async fn main() -> Result<()> {
             if summary.conflicts > 0 {
                 println!("  Conflicts skipped: {}", summary.conflicts);
             }
-            println!("Push completed.");
-            println!("Uploaded {} item(s).", summary.uploaded);
         }
         Commands::Pull => {
             let local_snapshot = adapter::scan_local_snapshot()?;
@@ -298,7 +297,21 @@ async fn push_local_changes(local_snapshot: &adapter::LocalSnapshot) -> Result<P
         .count();
     let mut uploaded_records = Vec::with_capacity(push_plan.len());
 
+    let pb = ProgressBar::new(push_plan.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:30.cyan/dim}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+
     for item in &push_plan {
+        pb.set_message(format!(
+            "{}/{}",
+            item.tool.as_str(),
+            item.rel_path
+        ));
+
         let config = item_index
             .get(&(
                 item.tool.as_str().to_string(),
@@ -329,7 +342,10 @@ async fn push_local_changes(local_snapshot: &adapter::LocalSnapshot) -> Result<P
             )
             .await?;
         uploaded_records.push(record);
+        pb.inc(1);
     }
+
+    pb.finish_and_clear();
 
     Ok(PushResult {
         summary: PushSummary {
@@ -375,7 +391,21 @@ async fn pull_remote_changes(local_snapshot: &adapter::LocalSnapshot) -> Result<
         ..PullSummary::default()
     };
 
+    let pb = ProgressBar::new(remote_only.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:30.cyan/dim}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+
     for entry in remote_only {
+        pb.set_message(format!(
+            "{}/{}",
+            entry.tool.as_str(),
+            entry.rel_path
+        ));
+
         let record = remote_records
             .get(&(
                 entry.tool.as_str().to_string(),
@@ -401,7 +431,10 @@ async fn pull_remote_changes(local_snapshot: &adapter::LocalSnapshot) -> Result<
         if applied.backup_path.is_some() {
             summary.backed_up += 1;
         }
+        pb.inc(1);
     }
+
+    pb.finish_and_clear();
 
     Ok(summary)
 }

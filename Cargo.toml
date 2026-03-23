@@ -45,6 +45,9 @@ dirs = "6"
 # Regex (for sanitizer)
 regex = "1"
 
+# Progress bar
+indicatif = "0.17"
+
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
